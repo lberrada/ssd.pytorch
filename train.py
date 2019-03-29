@@ -1,3 +1,6 @@
+# from cuda import set_cuda
+from nr import NR
+
 from data import *
 from utils.augmentations import SSDAugmentation
 from layers.modules import MultiBoxLoss
@@ -92,22 +95,25 @@ def train():
                                                          MEANS))
 
     config = logger.Config(**vars(args))
+    config.update(**cfg)
 
     Loc_Loss = logger.metric.Average()
     Conf_Loss = logger.metric.Average()
     Total_Loss = logger.metric.Simple()
     timer = logger.metric.Timer()
-    step_size = logger.metric.Average()
+    Step_Size = logger.metric.Average()
 
-    xp_name = 'ssd-{}'.format(args.opt)
+    xp_name = 'ssd-{}--eta-{}'.format(args.opt, args.lr)
     if args.visdom:
-        visdom_opts = {'env': xp_name, 'server': args.server, 'port': args.port}
-        plotter = logger.VisdomPlotter(visdom_opts)
-
+        config.server = 'http://atlas.robots.ox.ac.uk'
+        config.port = 9003
+        visdom_opts = {'env': xp_name, 'server': config.server, 'port': config.port}
+        plotter = logger.VisdomPlotter(visdom_opts, manual_update=True)
         config.plot_on(plotter)
         Loc_Loss.plot_on(plotter, 'Loss')
         Conf_Loss.plot_on(plotter, 'Loss')
         Total_Loss.plot_on(plotter, 'Loss')
+        Step_Size.plot_on(plotter, 'Step-Size')
 
         plotter.set_win_opts("Step-Size", {'ytype': 'log'})
 
@@ -140,7 +146,7 @@ def train():
         optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
                               weight_decay=args.weight_decay)
     elif args.opt == 'cosgd':
-        pass
+        optimizer = NR(net.parameters(), eta=args.lr)
     else:
         raise RuntimeError
     criterion = MultiBoxLoss(cfg['num_classes'], 0.5, True, 0, True, 3, 0.5,
@@ -148,9 +154,6 @@ def train():
 
     net.train()
     # loss counters
-    loc_loss = 0
-    conf_loss = 0
-    epoch = 0
     print('Loading the dataset...')
 
     epoch_size = len(dataset) // args.batch_size
@@ -163,54 +166,60 @@ def train():
     data_loader = data.DataLoader(dataset, args.batch_size,
                                   num_workers=args.num_workers,
                                   shuffle=True, collate_fn=detection_collate,
-                                  pin_memory=True)
+                                  pin_memory=False)
     # create batch iterator
     batch_iterator = iter(data_loader)
-    for iteration in range(args.start_iter, cfg['max_iter']):
-        if args.visdom and iteration % 10 == 1 and (iteration % epoch_size == 0):
-            update_vis_plot(viz, epoch, loc_loss, conf_loss, epoch_plot, None,
-                            'append', epoch_size)
-            # reset epoch loss counters
-            Loc_Loss.reset()
-            Conf_Loss.reset()
-            epoch += 1
+    max_epochs = cfg['max_iter'] // epoch_size
+    iteration = 0
+    for epoch in range(1, max_epochs + 1):
+        Loc_Loss.reset()
+        Conf_Loss.reset()
+        Step_Size.reset()
+        for images, targets in data_loader:
+            iteration += 1
 
-        if iteration in cfg['lr_steps']:
-            step_index += 1
-            adjust_learning_rate(optimizer, args.gamma, step_index)
+            if iteration in cfg['lr_steps']:
+                step_index += 1
+                adjust_learning_rate(optimizer, args.gamma, step_index)
 
-        # load train data
-        images, targets = next(batch_iterator)
+            if args.cuda:
+                images = images.cuda()
+                targets = [t.cuda() for t in targets]
 
-        if args.cuda:
-            images = images.cuda()
-            targets = [t.cuda() for t in targets]
+            # forward
+            t0 = time.time()
+            out = net(images)
+            # backprop
+            optimizer.zero_grad()
+            loss_l, loss_c = criterion(out, targets)
+            loss = loss_l + loss_c
+            loss.backward()
+            optimizer.step(lambda: float(loss))
+            t1 = time.time()
+            Loc_Loss.update(loss_l, weighting=images.size(0))
+            Conf_Loss.update(loss_c, weighting=images.size(0))
+            if not isinstance(optimizer, NR):
+                Step_Size.update(optimizer.param_groups[0]['lr'], weighting=images.size(0))
+            else:
+                Step_Size.update(optimizer.step_size)
 
-        # forward
-        t0 = time.time()
-        out = net(images)
-        # backprop
-        optimizer.zero_grad()
-        loss_l, loss_c = criterion(out, targets)
-        loss = loss_l + loss_c
-        loss.backward()
-        optimizer.step()
-        t1 = time.time()
-        Loc_Loss.update(loss_l, weighting=images.size(0))
-        Conf_Loss.update(conf_loss, weighting=images.size(0))
+            if iteration % 10 == 0:
 
-        if iteration % 10 == 0:
-            print('timer: %.4f sec.' % (t1 - t0))
-            print('iter ' + repr(iteration) + ' || Loss: %.4f ||' % (loss.item()), end=' ')
-            Total_Loss.update(Loc_Loss.value + Conf_Loss.value)
-            Loc_Loss.record(forced_legend='loc', forced_event_time=iteration)
-            Conf_Loss.record(forced_legend='conf', forced_event_time=iteration)
-            Total_Loss.record(forced_legend='total', forced_event_time=iteration)
+                print('timer: %.4f sec.' % (t1 - t0))
+                print('iter ' + repr(iteration) + ' || Loss: %.4f ||' % (loss.item()), end=' ')
+                Total_Loss.update(Loc_Loss.value + Conf_Loss.value)
+                Loc_Loss.record(forced_legend='loc', forced_event_time=iteration)
+                Conf_Loss.record(forced_legend='conf', forced_event_time=iteration)
+                Total_Loss.record(forced_legend='total', forced_event_time=iteration)
+                Step_Size.record(forced_event_time=iteration)
 
-        if iteration != 0 and iteration % 5000 == 0:
-            print('Saving state, iter:', iteration)
-            torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_' +
-                       repr(iteration) + '.pth')
+            if iteration % 100 == 0:
+                plotter.update_plots()
+
+            if iteration != 0 and iteration % 5000 == 0:
+                print('Saving state, iter:', iteration)
+                torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_' +
+                           repr(iteration) + '.pth')
     torch.save(ssd_net.state_dict(),
                args.save_folder + '' + args.dataset + '.pth')
 

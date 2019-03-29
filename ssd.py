@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from layers import *
 from data import voc, coco
+from nr import NR
 import os
 
 
@@ -31,7 +32,7 @@ class SSD(nn.Module):
         self.num_classes = num_classes
         self.cfg = (coco, voc)[num_classes == 21]
         self.priorbox = PriorBox(self.cfg)
-        self.priors = self.priorbox.forward().detach()
+        self.priors = self.priorbox.forward().detach().requires_grad_(False)
         self.size = size
 
         # SSD network
